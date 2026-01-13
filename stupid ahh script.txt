@@ -1,0 +1,154 @@
+function gitcommit-ai {
+    param (
+        [Parameter(Position = 0)]
+        [ValidateSet("push")]
+        [string]$Mode,
+
+        [Parameter(Position = 1)]
+        [string]$Branch
+    )
+
+    Import-Module BurntToast -ErrorAction SilentlyContinue
+
+    # ----- COLLECT CHANGES -----
+    $status = git --no-pager status --short
+
+    $diff = git --no-pager diff --staged | Select-Object -First 300
+    $source = "STAGED"
+
+    if (-not $diff) {
+        Write-Host "[WARN] No staged changes. Falling back to unstaged diff." -ForegroundColor Yellow
+        $diff = git --no-pager diff | Select-Object -First 300
+        $source = "UNSTAGED"
+    }
+
+    if (-not $diff) {
+        Write-Host "[ERROR] No changes found." -ForegroundColor Red
+        New-BurntToastNotification -Text "gitcommit-ai failed", "No changes detected."
+        return
+    }
+
+    # ----- PROMPT -----
+    $prompt = @"
+TASK:
+Generate a Git commit message that ACCURATELY DESCRIBES ALL CHANGES.
+
+THINKING RULES (INTERNAL):
+1. Identify ALL distinct change groups.
+2. Write bullets FIRST to cover all groups.
+3. Generate the subject LAST, strictly based on bullets.
+4. Prefer coverage over brevity.
+
+FORMAT (MANDATORY):
+Line 1: Conventional Commit subject
+        type(scope): summary derived from bullets
+Line 2+: Bullet outline (2–5 bullets max)
+        Each bullet MUST start with '- '
+
+STRICT RULES:
+- Bullets MUST collectively cover ALL major changes
+- NO explanations
+- NO paragraphs
+- NO prose
+- NO markdown
+- NO quotes
+- Output ONLY the commit + bullet outline
+- If unsure, use type 'chore'
+
+--- GIT STATUS ---
+$status
+
+--- $source CHANGES ---
+$diff
+"@
+
+    # ----- RUN OLLAMA WITH AUTO-RETRY -----
+    $raw = $null
+    for ($i = 1; $i -le 2 -and -not $raw; $i++) {
+        if ($i -gt 1) {
+            Write-Host "[WARN] Ollama failed, retrying..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 1
+        }
+
+        try {
+            $raw = $prompt | ollama run mistral 2>$null
+        } catch {
+            $raw = $null
+        }
+    }
+
+    if (-not $raw) {
+        Write-Host "[ERROR] Ollama failed after retry." -ForegroundColor Red
+        New-BurntToastNotification -Text "gitcommit-ai failed", "Ollama did not return a result."
+        return
+    }
+
+    # ----- PARSE OUTPUT -----
+    $lines = $raw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+
+    $bullets = $lines | Where-Object { $_ -like "- *" } | Select-Object -First 5
+
+    $subject = $lines | Where-Object {
+        $_ -match '^(feat|fix|refactor|chore|docs|test|style|perf|ci|build)\([a-zA-Z0-9_-]+\): .+'
+    } | Select-Object -First 1
+
+    if (-not $subject -and $bullets.Count -gt 0) {
+        $summary = ($bullets[0] -replace '^- ', '')
+        $subject = "chore: $summary"
+    }
+
+    if (-not $subject) {
+        $subject = "chore: update staged changes"
+    }
+
+    $final = @($subject) + $bullets
+    $commitMessage = $final -join "`n"
+
+    # ----- OUTPUT -----
+    Write-Host ""
+    Write-Host "AI Commit Message:" -ForegroundColor Cyan
+    $final | ForEach-Object { Write-Host $_ }
+
+    $commitMessage | clip
+    Write-Host ""
+    Write-Host "[OK] Commit message copied to clipboard." -ForegroundColor Green
+
+    # ----- USER ACTION PROMPT -----
+    Write-Host ""
+    Write-Host "Choose action:" -ForegroundColor Yellow
+    Write-Host "[Enter]  Do nothing"
+    Write-Host "c        Commit"
+    Write-Host "cp       Commit and push"
+    $choice = Read-Host ">"
+
+    if ($choice -eq "c" -or $choice -eq "cp") {
+        git commit -m $subject
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[ERROR] Git commit failed." -ForegroundColor Red
+            return
+        }
+
+        Write-Host "[OK] Commit created." -ForegroundColor Green
+    }
+
+    if ($choice -eq "cp" -or $Mode -eq "push") {
+        if (-not $Branch) {
+            $Branch = git branch --show-current
+        }
+
+        Write-Host "[INFO] Pushing to origin/$Branch..." -ForegroundColor Cyan
+        git push origin $Branch
+
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "[OK] Push completed." -ForegroundColor Green
+            New-BurntToastNotification `
+                -Text "gitcommit-ai finished", "Commit created and pushed to $Branch."
+        } else {
+            Write-Host "[ERROR] Push failed." -ForegroundColor Red
+        }
+    } else {
+        New-BurntToastNotification `
+            -Text "gitcommit-ai finished", "Commit message generated and copied to clipboard."
+    }
+}
