@@ -1,16 +1,22 @@
 function gitcommit-ai {
-    param (
-        [Parameter(Position = 0)]
-        [ValidateSet("push")]
-        [string]$Mode,
-
-        [Parameter(Position = 1)]
-        [string]$Branch
-    )
 
     Import-Module BurntToast -ErrorAction SilentlyContinue
 
-    # ----- COLLECT CHANGES -----
+    function Is-GenericCommit {
+        param ($Subject)
+        return $Subject -match '^chore:\s*(update|change|changes|code|staged changes)'
+    }
+
+    function Invoke-AI($Prompt) {
+        $raw = $null
+        for ($i = 1; $i -le 2 -and -not $raw; $i++) {
+            try { $raw = $Prompt | ollama run mistral 2>$null } catch {}
+            if (-not $raw) { Start-Sleep -Seconds 1 }
+        }
+        return $raw
+    }
+
+    # ----- COLLECT CHANGES ONCE -----
     $status = git --no-pager status --short
 
     $diff = git --no-pager diff --staged | Select-Object -First 300
@@ -24,36 +30,21 @@ function gitcommit-ai {
 
     if (-not $diff) {
         Write-Host "[ERROR] No changes found." -ForegroundColor Red
-        New-BurntToastNotification -Text "gitcommit-ai failed", "No changes detected."
         return
     }
 
-    # ----- PROMPT -----
-    $prompt = @"
+    $basePrompt = @"
 TASK:
-Generate a Git commit message that ACCURATELY DESCRIBES ALL CHANGES.
+Generate a SPECIFIC Git commit message.
 
-THINKING RULES (INTERNAL):
-1. Identify ALL distinct change groups.
-2. Write bullets FIRST to cover all groups.
-3. Generate the subject LAST, strictly based on bullets.
-4. Prefer coverage over brevity.
+RULES:
+- Mention concrete entities (files, tables, features)
+- Use verbs like add, remove, refactor, fix
+- NEVER use generic phrases like "update code"
 
-FORMAT (MANDATORY):
-Line 1: Conventional Commit subject
-        type(scope): summary derived from bullets
-Line 2+: Bullet outline (2–5 bullets max)
-        Each bullet MUST start with '- '
-
-STRICT RULES:
-- Bullets MUST collectively cover ALL major changes
-- NO explanations
-- NO paragraphs
-- NO prose
-- NO markdown
-- NO quotes
-- Output ONLY the commit + bullet outline
-- If unsure, use type 'chore'
+FORMAT:
+type(scope): summary
+- bullets (2–5)
 
 --- GIT STATUS ---
 $status
@@ -62,93 +53,53 @@ $status
 $diff
 "@
 
-    # ----- RUN OLLAMA WITH AUTO-RETRY -----
-    $raw = $null
-    for ($i = 1; $i -le 2 -and -not $raw; $i++) {
-        if ($i -gt 1) {
-            Write-Host "[WARN] Ollama failed, retrying..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 1
-        }
+    while ($true) {
 
-        try {
-            $raw = $prompt | ollama run mistral 2>$null
-        } catch {
-            $raw = $null
-        }
-    }
-
-    if (-not $raw) {
-        Write-Host "[ERROR] Ollama failed after retry." -ForegroundColor Red
-        New-BurntToastNotification -Text "gitcommit-ai failed", "Ollama did not return a result."
-        return
-    }
-
-    # ----- PARSE OUTPUT -----
-    $lines = $raw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-
-    $bullets = $lines | Where-Object { $_ -like "- *" } | Select-Object -First 5
-
-    $subject = $lines | Where-Object {
-        $_ -match '^(feat|fix|refactor|chore|docs|test|style|perf|ci|build)\([a-zA-Z0-9_-]+\): .+'
-    } | Select-Object -First 1
-
-    if (-not $subject -and $bullets.Count -gt 0) {
-        $summary = ($bullets[0] -replace '^- ', '')
-        $subject = "chore: $summary"
-    }
-
-    if (-not $subject) {
-        $subject = "chore: update staged changes"
-    }
-
-    $final = @($subject) + $bullets
-    $commitMessage = $final -join "`n"
-
-    # ----- OUTPUT -----
-    Write-Host ""
-    Write-Host "AI Commit Message:" -ForegroundColor Cyan
-    $final | ForEach-Object { Write-Host $_ }
-
-    $commitMessage | clip
-    Write-Host ""
-    Write-Host "[OK] Commit message copied to clipboard." -ForegroundColor Green
-
-    # ----- USER ACTION PROMPT -----
-    Write-Host ""
-    Write-Host "Choose action:" -ForegroundColor Yellow
-    Write-Host "[Enter]  Do nothing"
-    Write-Host "c        Commit"
-    Write-Host "cp       Commit and push"
-    $choice = Read-Host ">"
-
-    if ($choice -eq "c" -or $choice -eq "cp") {
-        git commit -m $subject
-
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[ERROR] Git commit failed." -ForegroundColor Red
+        # ----- GENERATE -----
+        $raw = Invoke-AI $basePrompt
+        if (-not $raw) {
+            Write-Host "[ERROR] AI failed." -ForegroundColor Red
             return
         }
 
-        Write-Host "[OK] Commit created." -ForegroundColor Green
-    }
+        $lines = $raw -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+        $bullets = $lines | Where-Object { $_ -like "- *" } | Select-Object -First 5
+        $subject = $lines | Where-Object {
+            $_ -match '^(feat|fix|refactor|chore|docs|test|style|perf|ci|build)\(.+\): .+'
+        } | Select-Object -First 1
 
-    if ($choice -eq "cp" -or $Mode -eq "push") {
-        if (-not $Branch) {
-            $Branch = git branch --show-current
+        if (-not $subject -or (Is-GenericCommit $subject)) {
+            Write-Host "[WARN] Generic commit detected. Regenerating..." -ForegroundColor Yellow
+            continue
         }
 
-        Write-Host "[INFO] Pushing to origin/$Branch..." -ForegroundColor Cyan
-        git push origin $Branch
+        $final = @($subject) + $bullets
+        $message = $final -join "`n"
 
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "[OK] Push completed." -ForegroundColor Green
-            New-BurntToastNotification `
-                -Text "gitcommit-ai finished", "Commit created and pushed to $Branch."
-        } else {
-            Write-Host "[ERROR] Push failed." -ForegroundColor Red
-        }
-    } else {
+        # ----- DISPLAY -----
+        Write-Host ""
+        Write-Host "AI Commit Message:" -ForegroundColor Cyan
+        $final | ForEach-Object { Write-Host $_ }
+
         New-BurntToastNotification `
-            -Text "gitcommit-ai finished", "Commit message generated and copied to clipboard."
+            -Text "gitcommit-ai", "Commit message generated. Press Enter to accept or N to regenerate."
+
+        Write-Host ""
+        Write-Host "Press [Enter] to copy | Type N + Enter to regenerate" -ForegroundColor Yellow
+        $input = Read-Host ">"
+
+        if ($input -match '^[Nn]$') {
+            Write-Host "[INFO] Regenerating commit message..." -ForegroundColor Yellow
+            continue
+        }
+
+        # ----- COPY & EXIT -----
+        $message | clip
+        Write-Host "[OK] Commit message copied to clipboard." -ForegroundColor Green
+
+        New-BurntToastNotification `
+            -Text "gitcommit-ai", "Commit message copied to clipboard."
+
+        break
     }
 }
